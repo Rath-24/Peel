@@ -1472,6 +1472,33 @@ function buildTextLayerLocal(origCanvas, words, w, h) {
   }
 }
 
+// ---- warmup: preload AI libraries on first upload intent ----
+// Downloads + compiles the models while the user is still choosing a file,
+// so the actual upload starts inferring immediately. Silent on failure.
+
+let _warmupStarted = false;
+function warmupLocalPipeline() {
+  if (_warmupStarted) return;
+  _warmupStarted = true;
+  statusBadge.textContent = 'warming up AI…';
+  const tasks = [];
+  tasks.push(import(LOCAL_BG_REMOVAL_URL).then(async ({ removeBackground }) => {
+    const tiny = document.createElement('canvas');
+    tiny.width = 32;
+    tiny.height = 32;
+    const b = await canvasToBlob(tiny);
+    await removeBackground(b, { model: 'isnet_quint8', output: { format: 'image/png', quality: 1 } });
+  }).catch((e) => console.warn('Warmup: segmentation preload failed.', e)));
+  tasks.push(loadScriptOnce(LOCAL_TESSERACT_URL).then(async () => {
+    const worker = await Tesseract.createWorker('eng');
+    await worker.terminate();
+  }).catch((e) => console.warn('Warmup: OCR preload failed.', e)));
+  tasks.push(loadOpenCV().catch((e) => console.warn('Warmup: background preload failed.', e)));
+  Promise.allSettled(tasks).then(() => { statusBadge.textContent = 'AI ready'; });
+}
+['pointerenter', 'focusin'].forEach((evt) => dropzone.addEventListener(evt, warmupLocalPipeline));
+window.addEventListener('dragenter', warmupLocalPipeline);
+
 // ---- recent images (localStorage) ----
 
 const RECENT_KEY = 'peel_recent';
