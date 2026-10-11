@@ -85,3 +85,12 @@ layers, and any OCR text boxes detected.
   extraction is attempted.
 - OCR is optional for the server to start, but text layers will be empty
   unless both `pytesseract` and the Tesseract executable are available.
+
+## Serverless (Vercel)
+
+When `/api/extract` is unreachable or reports missing AI dependencies (as on
+Vercel, which can't run `rembg` or the Tesseract binary), the page
+automatically falls back to an in-browser pipeline: subject segmentation via
+`@imgly/background-removal`, background inpainting via OpenCV.js, and OCR via
+Tesseract.js. The result is labeled `in-browser` in the toolbar. This needs
+internet access for the CDN libraries (loaded lazily on first use).

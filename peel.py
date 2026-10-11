@@ -1011,24 +1011,38 @@ async function handleFile(file) {
   const formData = new FormData();
   formData.append('image', file);
 
+  const startedAt = performance.now();
   try {
     const res = await fetch('/api/extract', { method: 'POST', body: formData });
-    const data = await res.json();
-    clearInterval(stepTimer);
-
-    if (!res.ok) {
-      showToast(data.error || 'Something went wrong processing that image.', true);
-      setState('empty');
+    if (res.ok) {
+      const data = await res.json();
+      clearInterval(stepTimer);
+      data.engine = 'server';
+      lastResult = data;
+      renderResult(data);
+      setState('result');
+      addToRecent(data);
       return;
     }
+    // Server answered but can't run the AI pipeline (e.g. serverless
+    // deployment without rembg/Tesseract) — fall through to local.
+    clearInterval(stepTimer);
+  } catch (err) {
+    // Backend unreachable — fall through to local processing.
+    clearInterval(stepTimer);
+  }
 
+  try {
+    showToast('Server pipeline unavailable — running in-browser AI instead.');
+    const data = await processLocally(file, startedAt);
+    data.engine = 'local';
     lastResult = data;
     renderResult(data);
     setState('result');
     addToRecent(data);
   } catch (err) {
-    clearInterval(stepTimer);
-    showToast('Could not reach the extraction service. Is the backend running?', true);
+    console.error(err);
+    showToast((err && err.message) || 'In-browser processing failed.', true);
     setState('empty');
   }
 }
@@ -1041,7 +1055,7 @@ function renderResult(data) {
   currentZoom = 1;
   applyZoom();
 
-  processingTime.textContent = `Processed in ${data.processing_seconds}s · ${data.width}×${data.height}`;
+  processingTime.textContent = `Processed in ${data.processing_seconds}s · ${data.width}×${data.height}${data.engine === 'local' ? ' · in-browser' : ''}`;
 
   data.layers.forEach(layer => {
     const img = document.getElementById(`layer-img-${layer.id}`);
@@ -1237,6 +1251,225 @@ function buildZip(files) {
   edv.setUint32(16, centralStart, true);
 
   return new Blob([...localParts, ...centralParts, eocd], { type: 'application/zip' });
+}
+
+// ---- local (in-browser) pipeline: fallback when /api/extract is unavailable ----
+// Runs entirely in the visitor's browser so extraction keeps working on
+// serverless hosts (Vercel) that cannot run rembg or Tesseract.
+// Needs internet access for the CDN libraries (loaded lazily, once).
+
+const LOCAL_BG_REMOVAL_URL = 'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/+esm';
+const LOCAL_TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+const LOCAL_OPENCV_URL = 'https://docs.opencv.org/4.8.0/opencv.js';
+const LOCAL_MAX_DIMENSION = 1600;
+
+const _scriptCache = {};
+function loadScriptOnce(src) {
+  if (_scriptCache[src]) return _scriptCache[src];
+  _scriptCache[src] = new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = src;
+    el.onload = () => resolve();
+    el.onerror = () => reject(new Error(`Failed to load library from CDN.`));
+    document.head.appendChild(el);
+  });
+  return _scriptCache[src];
+}
+
+function loadImageFromBlob(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Could not decode image. Use JPG or PNG.')); };
+    img.src = url;
+  });
+}
+
+function canvasToBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Canvas export failed.'))), 'image/png');
+  });
+}
+
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Could not read result.'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function setLocalStep(label) {
+  processingLabel.textContent = label;
+}
+
+async function processLocally(file, startedAt) {
+  setLocalStep('Loading image…');
+  const img = await loadImageFromBlob(file);
+  let w = img.naturalWidth || img.width;
+  let h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error('Could not decode image. Use JPG or PNG.');
+  const scale = Math.min(1, LOCAL_MAX_DIMENSION / Math.max(w, h));
+  w = Math.round(w * scale);
+  h = Math.round(h * scale);
+
+  const origCanvas = document.createElement('canvas');
+  origCanvas.width = w;
+  origCanvas.height = h;
+  origCanvas.getContext('2d').drawImage(img, 0, 0, w, h);
+
+  // Subject segmentation + OCR run in parallel (both only need the image).
+  setLocalStep('Segmenting subject… (first run downloads the AI model)');
+  const subjectPromise = (async () => {
+    const { removeBackground } = await import(LOCAL_BG_REMOVAL_URL);
+    const inputBlob = await canvasToBlob(origCanvas);
+    return removeBackground(inputBlob, {
+      model: 'isnet_quint8',
+      output: { format: 'image/png', quality: 1 },
+      progress: (key) => {
+        const k = String(key);
+        if (k.startsWith('fetch:')) setLocalStep('Downloading AI model…');
+        else if (k.startsWith('compute:')) setLocalStep('Segmenting subject…');
+      },
+    });
+  })();
+
+  const ocrPromise = (async () => {
+    await loadScriptOnce(LOCAL_TESSERACT_URL);
+    const worker = await Tesseract.createWorker('eng');
+    try {
+      const { data } = await worker.recognize(origCanvas);
+      return data.words || [];
+    } finally {
+      await worker.terminate();
+    }
+  })().catch((err) => {
+    console.warn('Local OCR failed, continuing without text layer.', err);
+    return [];
+  });
+
+  const [subjectBlob, words] = await Promise.all([subjectPromise, ocrPromise]);
+
+  setLocalStep('Building layers…');
+  const subjectDataUrl = await blobToDataURL(subjectBlob);
+  const subjectImg = await loadImageFromBlob(subjectBlob);
+  const subjectCanvas = document.createElement('canvas');
+  subjectCanvas.width = w;
+  subjectCanvas.height = h;
+  subjectCanvas.getContext('2d').drawImage(subjectImg, 0, 0, w, h);
+
+  let backgroundDataUrl;
+  try {
+    setLocalStep('Reconstructing background…');
+    backgroundDataUrl = await inpaintBackgroundLocal(origCanvas, subjectCanvas, w, h);
+  } catch (err) {
+    console.warn('Local inpaint failed, using original as background.', err);
+    backgroundDataUrl = origCanvas.toDataURL('image/png');
+    showToast('Background inpaint unavailable — used original image instead.');
+  }
+
+  const textResult = buildTextLayerLocal(origCanvas, words, w, h);
+
+  const elapsed = Math.round(((performance.now() - startedAt) / 1000) * 100) / 100;
+  return {
+    width: w,
+    height: h,
+    processing_seconds: elapsed,
+    layers: [
+      { id: 'background', name: 'Background', data_url: backgroundDataUrl },
+      { id: 'subject', name: 'Subject', data_url: subjectDataUrl },
+      { id: 'text', name: 'Text', data_url: textResult.dataUrl },
+    ],
+    detected_text: textResult.boxes,
+  };
+}
+
+let _cvReady = null;
+function loadOpenCV() {
+  if (window.cv && window.cv.Mat) return Promise.resolve(window.cv);
+  if (!_cvReady) {
+    _cvReady = loadScriptOnce(LOCAL_OPENCV_URL).then(() => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Background library timed out.')), 60000);
+      const cvLib = window.cv;
+      if (cvLib && cvLib.Mat) { clearTimeout(timer); resolve(cvLib); return; }
+      if (cvLib) {
+        cvLib.onRuntimeInitialized = () => { clearTimeout(timer); resolve(cvLib); };
+      } else {
+        clearTimeout(timer);
+        reject(new Error('Background library failed to initialise.'));
+      }
+    })).catch((err) => { _cvReady = null; throw err; });
+  }
+  return _cvReady;
+}
+
+async function inpaintBackgroundLocal(origCanvas, subjectCanvas, w, h) {
+  const cvLib = await loadOpenCV();
+  const src = cvLib.imread(origCanvas);
+  let mask = null;
+  let kernel = null;
+  let dst = null;
+  try {
+    const subj = subjectCanvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h);
+    mask = new cvLib.Mat(h, w, cvLib.CV_8UC1);
+    for (let i = 0; i < w * h; i++) mask.data[i] = subj.data[i * 4 + 3] > 127 ? 255 : 0;
+    const dilateSize = Math.max(3, Math.floor(Math.min(w, h) / 250)) | 1;
+    kernel = cvLib.getStructuringElement(cvLib.MORPH_ELLIPSE, new cvLib.Size(dilateSize, dilateSize));
+    cvLib.dilate(mask, mask, kernel);
+    const radius = Math.max(3, Math.min(12, Math.floor(Math.min(w, h) / 200)));
+    dst = new cvLib.Mat();
+    cvLib.inpaint(src, mask, dst, radius, cvLib.INPAINT_TELEA);
+    const out = document.createElement('canvas');
+    out.width = w;
+    out.height = h;
+    cvLib.imshow(out, dst);
+    return out.toDataURL('image/png');
+  } finally {
+    if (src) src.delete();
+    if (mask) mask.delete();
+    if (kernel) kernel.delete();
+    if (dst) dst.delete();
+  }
+}
+
+function buildTextLayerLocal(origCanvas, words, w, h) {
+  const textCanvas = document.createElement('canvas');
+  textCanvas.width = w;
+  textCanvas.height = h;
+  const tctx = textCanvas.getContext('2d');
+  const boxes = [];
+  for (const wd of words) {
+    const text = String((wd && wd.text) || '').trim();
+    const conf = Math.round(Number((wd && wd.confidence) ?? -1));
+    if (!text || !(conf > 30) || !wd.bbox) continue;
+    let x0 = wd.bbox.x0;
+    let y0 = wd.bbox.y0;
+    let x1 = wd.bbox.x1;
+    let y1 = wd.bbox.y1;
+    const pad = Math.max(3, Math.round(Math.min(x1 - x0, y1 - y0) * 0.15));
+    x0 = Math.max(0, Math.floor(x0 - pad));
+    y0 = Math.max(0, Math.floor(y0 - pad));
+    x1 = Math.min(w, Math.ceil(x1 + pad));
+    y1 = Math.min(h, Math.ceil(y1 + pad));
+    if (x1 <= x0 || y1 <= y0) continue;
+    tctx.drawImage(origCanvas, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+    boxes.push({ text, conf, bbox: [x0, y0, x1, y1] });
+  }
+  if (!boxes.length) return { dataUrl: textCanvas.toDataURL('image/png'), boxes };
+  try {
+    const blurK = Math.max(3, Math.floor(Math.min(w, h) / 400)) | 1;
+    const soft = document.createElement('canvas');
+    soft.width = w;
+    soft.height = h;
+    const sctx = soft.getContext('2d');
+    sctx.filter = `blur(${Math.round(blurK / 2)}px)`;
+    sctx.drawImage(textCanvas, 0, 0);
+    return { dataUrl: soft.toDataURL('image/png'), boxes };
+  } catch (e) {
+    return { dataUrl: textCanvas.toDataURL('image/png'), boxes };
+  }
 }
 
 // ---- recent images (localStorage) ----
