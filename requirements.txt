@@ -1,0 +1,9 @@
+# Minimal deps for the Vercel serverless deployment.
+# Serves the UI + health check. `/api/extract` needs opencv/numpy and
+# degrades to a clear 503 if they are unavailable; full subject
+# segmentation (rembg/U^2-Net) and OCR (tesseract binary) are not
+# available on Vercel — use Render/Railway/Fly.io for the full pipeline.
+flask>=3.0
+Pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.8

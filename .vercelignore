@@ -1,0 +1,17 @@
+# Keep the Vercel deployment small: only peel.py + api/ + requirements.
+# The repo root contains unrelated demo projects that would otherwise
+# blow past the serverless size limit.
+.git
+node_modules
+__pycache__
+.venv
+EduSpark
+FunExplorer
+medcheck-ai
+medcheck-ai.zip
+passwordless-auth
+portfolio
+portfolio-3d
+Smart Hospital Queue System
+zk-health-vault
+package-lock.json

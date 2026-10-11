@@ -26,8 +26,15 @@ import logging
 import os
 import time
 
-import cv2
-import numpy as np
+try:
+    import cv2  # type: ignore[reportMissingImports]
+except ImportError:  # pragma: no cover - serverless envs may omit heavy deps
+    cv2 = None
+
+try:
+    import numpy as np  # type: ignore[reportMissingImports]
+except ImportError:  # pragma: no cover - serverless envs may omit heavy deps
+    np = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,14 +58,23 @@ except ImportError:  # pragma: no cover
     new_session = None
 
 
+_OCR_CACHED = None
+
+
 def has_ocr_support():
     """Return True when pytesseract is importable and the Tesseract binary is available."""
+    global _OCR_CACHED
+    if _OCR_CACHED is not None:
+        return _OCR_CACHED
     if pytesseract is None:
+        _OCR_CACHED = False
         return False
     try:
         pytesseract.get_tesseract_version()
+        _OCR_CACHED = True
         return True
     except Exception:  # pragma: no cover - depends on local OCR runtime
+        _OCR_CACHED = False
         return False
 
 # ----------------------------------------------------------------------
@@ -79,9 +95,10 @@ def get_session():
 
 def extract_subject_mask(image_bgr):
     """Runs U^2-Net salient object segmentation, returns a clean alpha mask (0-255, uint8)."""
+    if cv2 is None or np is None:
+        raise RuntimeError("opencv/numpy are not installed. Install them with: pip install opencv-python-headless numpy")
     if remove is None or new_session is None:
-        h, w = image_bgr.shape[:2]
-        return np.full((h, w), 255, dtype=np.uint8)
+        raise RuntimeError("rembg is not installed. Install it with: pip install rembg onnxruntime")
 
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(rgb)
@@ -189,7 +206,7 @@ def build_text_layer(image_bgr):
 
 def rgba_to_data_url(rgba_array):
     buf = io.BytesIO()
-    Image.fromarray(rgba_array, mode="RGBA").save(buf, format="PNG")
+    Image.fromarray(rgba_array).save(buf, format="PNG")
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
 
@@ -1382,6 +1399,9 @@ def extract():
     file = request.files["image"]
     if file.filename == "":
         return jsonify({"error": "Empty filename."}), 400
+
+    if cv2 is None or np is None:
+        return jsonify({"error": "Image processing dependencies (opencv/numpy) are not installed on this deployment."}), 503
 
     raw = file.read()
     np_arr = np.frombuffer(raw, np.uint8)
